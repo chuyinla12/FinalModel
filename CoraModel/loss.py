@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def contrastive_loss(qi, qj, mask, temperature, weight):
+def contrastive_loss(qi, qj, mask, temperature, weight, neg_weights=None):
     qi = F.normalize(qi, p=2, dim=1)
     qj = F.normalize(qj, p=2, dim=1)
 
@@ -14,8 +14,14 @@ def contrastive_loss(qi, qj, mask, temperature, weight):
     logits_mask = torch.ones_like(mask) - torch.eye(mask.size(0), device=mask.device)
     pos_mm = (mask * sim_mm * logits_mask).sum(dim=1)
     pos_mn = (mask * sim_mn).sum(dim=1)
-    neg_mm = sim_mm.sum(dim=1)
-    neg_mn = sim_mn.sum(dim=1)
+    
+    if neg_weights is not None:
+        # 对负样本进行加权 (课程学习：低置信度节点作为“硬负样本”)
+        neg_mm = (sim_mm * neg_weights.unsqueeze(0)).sum(dim=1)
+        neg_mn = (sim_mn * neg_weights.unsqueeze(0)).sum(dim=1)
+    else:
+        neg_mm = sim_mm.sum(dim=1)
+        neg_mn = sim_mn.sum(dim=1)
 
     loss_val = (pos_mm + pos_mn) / (neg_mm + neg_mn + 1e-10)
     loss_val = torch.clamp(loss_val, min=1e-10)
@@ -49,13 +55,11 @@ def centroid_level_loss(u_view, u_all, temperature, weight=1.0):
     return contrastive_loss(u_view, u_all, mask, temperature, weight)
 
 
-def instance_centroid_loss(h, centroids, labels, temperature, weight=1.0):
+def instance_centroid_loss(h, centroids, labels, temperature, weight=1.0, mask=None):
     """
     实例-簇心级别损失 (Instance-Centroid Contrastive Loss)。
-    让节点嵌入 h 与其对应的簇中心（如 Soft Centroids）更紧密。
-    h: [N, D]
-    centroids: [K, D]
-    labels: [N] (伪标签/分配)
+    让节点嵌入 h 与其对应的簇中心更紧密。
+    mask: [N] 可选的权重掩码，用于课程学习（置信度引导）。
     """
     if weight <= 0 or centroids is None:
         return torch.tensor(0.0, device=h.device)
@@ -66,8 +70,15 @@ def instance_centroid_loss(h, centroids, labels, temperature, weight=1.0):
     # 计算节点与所有簇中心的相似度: [N, K]
     logits = torch.mm(h, centroids.t()) / temperature
     
-    # InfoNCE 等价于交叉熵损失，其中正样本是伪标签对应的中心
-    return weight * F.cross_entropy(logits, labels)
+    # 计算基础交叉熵损失
+    loss_all = F.cross_entropy(logits, labels, reduction="none")
+    
+    if mask is not None:
+        # 应用课程学习掩码
+        loss_all = loss_all * mask
+        return weight * loss_all.sum() / (mask.sum() + 1e-10)
+    
+    return weight * loss_all.mean()
 
 
 def feature_level_loss(h_view, h_all, temperature, weight=1.0):

@@ -77,12 +77,14 @@ def build_args():
     p.add_argument("--w_centroid", type=float, default=defaults.get("w_centroid", 1.0))
     p.add_argument("--w_inst_cent", type=float, default=defaults.get("w_inst_cent", 1.0))
     p.add_argument("--w_feature", type=float, default=defaults.get("w_feature", 1.0), help="维度级对比损失权重")
+    p.add_argument("--conf_warmup_epochs", type=int, default=defaults.get("conf_warmup_epochs", 100), help="课程学习置信度热身周期")
+    p.add_argument("--min_conf_ratio", type=float, default=defaults.get("min_conf_ratio", 0.2), help="初始阶段选取的最小置信度节点比例")
     p.add_argument("--w_ne", type=float, default=defaults.get("w_ne", 4.0))
     p.add_argument("--w_kl", type=float, default=defaults.get("w_kl", 1.0))
     p.add_argument("--tau_sample", type=float, default=defaults.get("tau_sample", 0.5))
     p.add_argument("--tau_cluster", type=float, default=defaults.get("tau_cluster", 0.2))
     p.add_argument("--kl_max", type=float, default=defaults.get("kl_max", 0.5))
-    p.add_argument("--kl_anneal_epochs", type=int, default=defaults.get("kl_anneal_epochs", 50))
+    p.add_argument("--kl_anneal_epochs", type=int, default=defaults.get("kl_anneal_epochs", 150))
     p.add_argument("--early_stop_patience", type=int, default=defaults.get("early_stop_patience", 0))
     return p.parse_args()
 
@@ -192,13 +194,31 @@ def main():
         loss_inst_cent = 0.0
         loss_ne = 0.0
         
+        # --- 置信度引导 + 课程学习策略 ---
+        conf = cluster_all.max(dim=1)[0].detach()
+        # 计算当前 epoch 的选取比例 (从 min_conf_ratio 线性增长到 1.0)
+        warmup = max(1, int(args.conf_warmup_epochs))
+        curr_ratio = min(1.0, args.min_conf_ratio + (1.0 - args.min_conf_ratio) * (epoch / warmup))
+        
+        # 1. 选取高置信度节点作为“易学习”的正样本
+        num_high = int(len(conf) * curr_ratio)
+        if num_high > 0:
+            threshold_high = torch.kthvalue(conf, len(conf) - num_high + 1)[0]
+            mask_high = (conf >= threshold_high).float()
+        else:
+            mask_high = torch.ones_like(conf)
+
+        # 2. 选取低置信度节点作为“硬负样本” (Hard Negatives)
+        # 课程学习：随着训练进行，逐渐减小负样本的惩罚，或者保持对不确定节点的关注
+        neg_weights = 1.0 + (1.0 - conf)  # 置信度越低，作为负样本的权重越大
+
         # 视图间的对比损失 (v1 vs v2)
         u_v = [soft_cluster_centroids(cluster_q[v], hs[v]) for v in range(2)]
         u_all = soft_cluster_centroids(cluster_all, h_all)
         
-        # 1. 视图间样本对比 (align same nodes)
+        # 1. 视图间样本对比 (应用硬负样本权重)
         mask_node = torch.eye(hs[0].size(0), device=device)
-        loss_sample_cross = contrastive_loss(hs[0], hs[1], mask_node, args.tau_sample, args.w_sample)
+        loss_sample_cross = contrastive_loss(hs[0], hs[1], mask_node, args.tau_sample, args.w_sample, neg_weights=neg_weights)
         
         # 2. 视图间簇对比 (align same clusters)
         loss_cluster_cross = cluster_level_loss(cluster_q[0], cluster_q[1], args.tau_cluster, args.w_cluster)
@@ -206,31 +226,30 @@ def main():
         # 3. 视图间簇心对比 (align same centroids)
         loss_centroid_cross = centroid_level_loss(u_v[0], u_v[1], args.tau_cluster, args.w_centroid)
 
-        # 4. 视图间维度对比 (align same feature dimensions)
-        loss_feature_cross = feature_level_loss(hs[0], hs[1], args.tau_sample, args.w_feature)
+        # 4. 视图间维度对比 ( align same feature dimensions v1 vs v2 )
+        loss_feature = feature_level_loss(hs[0], hs[1], args.tau_sample, args.w_feature)
 
         # 视图与融合视图的对比 (v vs all)
         for v in range(2):
             loss_sample = loss_sample + sample_level_loss(adjs[v], hs[v], h_all, args.tau_sample, args.w_sample)
             loss_cluster = loss_cluster + cluster_level_loss(cluster_q[v], cluster_all, args.tau_cluster, args.w_cluster)
             loss_centroid = loss_centroid + centroid_level_loss(u_v[v], u_all, args.tau_cluster, args.w_centroid)
-            loss_feature = loss_feature + feature_level_loss(hs[v], h_all, args.tau_sample, args.w_feature)
             loss_ne = loss_ne + criterion_ne(cluster_q[v], cluster_all)
 
         # 实例-簇心级别损失 (使用模型预测的 soft 中心和伪标签)
         labels_soft = torch.argmax(cluster_all, dim=1).detach()
-        loss_inst_cent = instance_centroid_loss(h_all, u_all, labels_soft, args.tau_cluster, args.w_inst_cent)
+        # 计算实例-簇心级损失，并应用课程学习掩码 (仅对高置信度节点对齐中心)
+        loss_inst_cent = instance_centroid_loss(h_all, u_all, labels_soft, args.tau_cluster, args.w_inst_cent, mask=mask_high)
             
         loss_sample = (loss_sample / 2.0 + loss_sample_cross) / 2.0
         loss_cluster = (loss_cluster / 2.0 + loss_cluster_cross) / 2.0
         loss_centroid = (loss_centroid / 2.0 + loss_centroid_cross) / 2.0
-        loss_feature = (loss_feature / 2.0 + loss_feature_cross) / 2.0
         loss_ne = loss_ne / 2.0
 
         loss_kl = kl_loss_soft_centroids(
             cluster_q, hs, cluster_all, h_all, epoch, args.kl_max, args.kl_anneal_epochs
         )
-        loss = loss_sample + loss_cluster + 0*loss_centroid + loss_feature + 0*loss_inst_cent + loss_ne + float(args.w_kl) * loss_kl
+        loss = loss_sample + loss_cluster + loss_centroid + loss_feature + loss_inst_cent + loss_ne + loss_kl
 
         if (epoch + 1) % int(args.print_interval) == 0 or epoch == 0:
             w_list = weights_h.cpu().tolist()
@@ -240,6 +259,7 @@ def main():
                 f"feat {loss_feature.item():.4f} "
                 f"centroid {loss_centroid.item():.4f} inst_cent {loss_inst_cent.item() if torch.is_tensor(loss_inst_cent) else loss_inst_cent:.4f} "
                 f"ne {loss_ne.item():.4f} kl {loss_kl.item():.4f} "
+                f"ratio {curr_ratio:.2f} "
                 f"weights [{w_list[0]:.3f}, {w_list[1]:.3f}] "
                 f"homo [{homo_rate[0]:.3f}, {homo_rate[1]:.3f}]"
             )
